@@ -1,4 +1,19 @@
-# IRext AtomS3 Lite — 独立枚举器
+# IRext AtomS3 Lite — 独立枚举器 / Standalone Enumerator
+
+# IRext AtomS3 Lite — 独立枚举器 (IRext-AtomS3-Enumerator)
+
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-ESP32S3-blue?logo=espressif" />
+<a href="https://www.arduino.cc/">
+    <img src="https://img.shields.io/badge/framework-Arduino-teal?logo=arduino" />
+  </a>
+<a href="https://github.com/irext/irext">
+      <img src="https://img.shields.io/badge/IR-IRext-orange" />
+  </a>
+  <img src="https://img.shields.io/badge/license-MIT-green" />
+</p>
+
+---
 
 不依赖电脑，AtomS3 Lite 单独开 AP，连上后弹出黑底绿字 Web 终端，
 配合板载按键完成红外码枚举测试。也支持电脑联机推送（模式B）。
@@ -35,6 +50,10 @@ python3 upload_bins.py prepare \
     --brand 格力 --cat 1 \
     --out data
 ```
+
+`cat <填入通过db数据库查到的类别id，例如空调是1、TV是2>`
+
+需要将数据库文件放在py脚本同目录下
 
 会把匹配的 bin 复制到 `data/`，重命名为 `<catId>_<subCat>_<序号>.bin`（如 `2_1_001.bin`）。
 LittleFS 对文件名长度有限制（约28字节），原始 protocol/remote 名称不再放进文件名，
@@ -100,6 +119,39 @@ python3 upload_bins.py remote \
 
 ## 注意事项
 
-- LittleFS 容量有限（AtomS3 Lite 默认分区约 1.4MB），一次性塞太多品牌的 bin 可能放不下，建议按品牌分批 `prepare`。
-- `prepare` 会清空重名文件，不会清空 `data/` 里其他已有文件；换品牌测试前建议先手动清空 `data/` 目录再 `prepare`。
-- AP 模式下 AtomS3 不连接外部 Wi-Fi，断网测试期间无法用原来的 `irext_client.py`（那个脚本依赖 AtomS3 主动连接你的路由器）。
+- **LittleFS 容量限制**：AtomS3 Lite 默认分区约 1.4MB，一次性塞太多品牌的 bin 可能放不下，建议按品牌分批 `prepare`
+- **文件管理**：`prepare` 会清空重名文件，不会清空 `data/` 里其他已有文件；换品牌测试前建议先手动清空 `data/` 目录再 `prepare`
+- **Wi-Fi 模式**：AP 模式下 AtomS3 不连接外部 Wi-Fi，断网测试期间无法用原来的 `irext_client.py`（那个脚本依赖 AtomS3 主动连接你的路由器）
+
+## 常见编译错误
+
+### avr/pgmspace.h 找不到
+
+**错误信息：**
+
+```bash
+In file included from path/to/file.ino:2:
+path/to/MPU6050.h:45:10: fatal error: avr/pgmspace.h: No such file or directory
+45 | #include <avr/pgmspace.h>
+|          ^~~~~~~~~~~~~~~~
+compilation terminated.
+```
+
+**原因：**
+
+- `avr/pgmspace.h` 是 AVR 平台（如 Arduino Uno）专用的头文件，用于访问程序存储器（Flash）
+- ESP32 平台使用不同的工具链，`pgmspace.h` 文件位于 `esp32/cores/esp32/` 目录下
+- 库代码直接包含 `<avr/pgmspace.h>` 会导致 ESP32 编译失败
+
+**解决方案：**
+
+1. 找到报错的文件（如 `MPU6050.h`）
+2. 将以下行：
+   ```cpp
+   #include <avr/pgmspace.h>
+   ```
+   修改为：
+   ```cpp
+   #include <pgmspace.h>
+   ```
+3. 保存文件并重新编译
