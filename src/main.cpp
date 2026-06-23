@@ -65,6 +65,7 @@ static int  g_testMode     = 0;
 static int  g_testFan      = 0;
 static int  g_testPower    = 0;      // 0=开机 1=关机
 static int  g_testSwing    = 0;      // 0=扫风开 1=扫风关
+static int  g_acFuncCode   = 0;      // ir_decode 第1参数: 0=电源/完整帧 9=风速 10=扫风 1=模式
 static int  g_testCat      = 1;      // category_id
 static int  g_testSubcat   = 1;      // sub_category
 
@@ -130,7 +131,7 @@ bool irSend() {
     ac.ac_mode       = (t_ac_mode)g_testMode;
     ac.ac_wind_speed = (t_ac_wind_speed)g_testFan;
     ac.ac_wind_dir   = (t_ac_swing)g_testSwing;
-    rawLen = ir_decode(0, g_rawBuf, &ac);
+    rawLen = ir_decode(g_acFuncCode, g_rawBuf, &ac);
   } else {
     rawLen = ir_decode(g_testKeycode, g_rawBuf, nullptr);
   }
@@ -258,21 +259,29 @@ void printHelp() {
   termPrint("╔══════════════════════════════════════╗");
   termPrint("║   IRext AtomS3 枚举器 — 命令列表     ║");
   termPrint("╠══════════════════════════════════════╣");
-  termPrint("║ start          开始枚举               ║");
-  termPrint("║ next / n       发射并进入下一条        ║");
-  termPrint("║ hit  / h       标记当前命中            ║");
-  termPrint("║ resend / r     重发当前                ║");
-  termPrint("║ skip / s       跳过不发射              ║");
-  termPrint("║ status         显示状态                ║");
-  termPrint("║ list           列出所有 bin 文件        ║");
-  termPrint("║ goto <n>       跳到第n条               ║");
-  termPrint("║ setac <t> <m> <f> [sw] [pw] 设空调参数 ║");
-  termPrint("║ off                立即发关机指令        ║");
-  termPrint("║   t=温度 m=模式 f=风速                 ║");
-  termPrint("║ settv <keycode>    切换为TV按键模式     ║");
-  termPrint("║ setcat <cat> <sub> 设category          ║");
-  termPrint("║ loglevel <0-3> 日志级别                ║");
-  termPrint("║ help           显示此帮助              ║");
+  termPrint("║ 枚举控制                              ║");
+  termPrint("║  start        开始枚举                ║");
+  termPrint("║  next/n       发射并进入下一条         ║");
+  termPrint("║  hit/h        标记命中并跳下一条       ║");
+  termPrint("║  resend/r     重发当前（不跳）         ║");
+  termPrint("║  skip/s       跳过不发射               ║");
+  termPrint("║  goto <n>     跳到第n条               ║");
+  termPrint("║  status       显示当前状态             ║");
+  termPrint("║  list         列出所有bin及命中标记    ║");
+  termPrint("╠══════════════════════════════════════╣");
+  termPrint("║ 空调快捷控制（需先枚举命中某bin）      ║");
+  termPrint("║  temp <16-30> / temp+ / temp-  调温   ║");
+  termPrint("║  fan <0-3>  / fan+  / fan-    调风速  ║");
+  termPrint("║    0=自动 1=低 2=中 3=高               ║");
+  termPrint("║  swing on/off/（不带参数=切换）调扫风  ║");
+  termPrint("║  mode <0-4>/cool/heat/auto/fan/dry    ║");
+  termPrint("║  off          发关机指令               ║");
+  termPrint("║  setac <t><m><f>[sw][pw] 一次性设全部  ║");
+  termPrint("╠══════════════════════════════════════╣");
+  termPrint("║ 其他                                  ║");
+  termPrint("║  settv <keycode>  切换为TV按键模式     ║");
+  termPrint("║  setcat <cat><sub> 手动设category      ║");
+  termPrint("║  help         显示此帮助               ║");
   termPrint("╚══════════════════════════════════════╝");
 }
 
@@ -315,17 +324,83 @@ void handleCommand(const String& rawCmd) {
     }
   } else if (cmd.startsWith("setac")) {
     // setac <temp> <mode> <fan> [swing=0/1] [power=0/1]
-    // 参数均可省略，未填的保持上次值
+    // 未填的参数保持上次值
     int t=g_testTemp, m=g_testMode, f=g_testFan, sw=g_testSwing, pw=g_testPower;
     sscanf(cmd.c_str(), "setac %d %d %d %d %d", &t, &m, &f, &sw, &pw);
+    // 推算本次主要变化的 function code（ir_decode 第1参数）
+    // 只要发生变化就用对应的专用 function，都没变则用电源/完整帧(0)
+    if      (f  != g_testFan)   g_acFuncCode = 9;   // AC_FUNCTION_WIND_SPEED
+    else if (sw != g_testSwing) g_acFuncCode = 10;  // AC_FUNCTION_WIND_SWING
+    else if (m  != g_testMode)  g_acFuncCode = 1;   // AC_FUNCTION_MODE
+    else if (pw != g_testPower) g_acFuncCode = 0;   // AC_FUNCTION_POWER
+    else                        g_acFuncCode = 0;   // 温度或其他，用完整帧
     g_testIsAc = true;
     g_testTemp = t; g_testMode = m; g_testFan = f;
     g_testSwing = sw; g_testPower = pw;
-    termPrint("[*] AC: %s %d℃ mode=%d fan=%d swing=%d",
-             pw==0?"开机":"关机", t, m, f, sw);
+    const char* modeStr[] = {"制冷","制热","自动","送风","除湿"};
+    const char* fanStr[]  = {"自动","低","中","高"};
+    termPrint("[*] AC: %s %d℃ %s 风速:%s 扫风:%s (func=%d)",
+              pw==0?"开机":"关机", t,
+              m>=0&&m<=4 ? modeStr[m] : "?",
+              f>=0&&f<=3 ? fanStr[f]  : "?",
+              sw==0?"开":"关", g_acFuncCode);
+
+  } else if (cmd.startsWith("fan")) {
+    // fan+ / fan- / fan <0-3>
+    g_testIsAc   = true;
+    g_acFuncCode = 9;  // AC_FUNCTION_WIND_SPEED
+    if (cmd == "fan+") {
+      g_testFan = min(g_testFan + 1, 3);
+    } else if (cmd == "fan-") {
+      g_testFan = max(g_testFan - 1, 0);
+    } else {
+      int f = g_testFan;
+      sscanf(cmd.c_str(), "fan %d", &f);
+      g_testFan = constrain(f, 0, 3);
+    }
+    const char* fanStr[] = {"自动","低","中","高"};
+    termPrint("[*] 风速 → %s，正在发射...", fanStr[g_testFan]);
+    if (!irSend()) termPrint("[E] 发射失败");
+
+  } else if (cmd.startsWith("swing")) {
+    // swing on / swing off / swing（切换）
+    g_testIsAc   = true;
+    g_acFuncCode = 10; // AC_FUNCTION_WIND_SWING
+    if (cmd == "swing on")       g_testSwing = 0;
+    else if (cmd == "swing off") g_testSwing = 1;
+    else                         g_testSwing = g_testSwing ? 0 : 1; // 切换
+    termPrint("[*] 扫风 → %s，正在发射...", g_testSwing==0?"开":"关");
+    if (!irSend()) termPrint("[E] 发射失败");
+
+  } else if (cmd.startsWith("mode")) {
+    // mode <0-4>  或  mode cool/heat/auto/fan/dry
+    g_testIsAc   = true;
+    g_acFuncCode = 1;  // AC_FUNCTION_MODE
+    int m = g_testMode;
+    if      (cmd.indexOf("cool") >= 0 || cmd.indexOf("冷") >= 0) m = 0;
+    else if (cmd.indexOf("heat") >= 0 || cmd.indexOf("热") >= 0) m = 1;
+    else if (cmd.indexOf("auto") >= 0 || cmd.indexOf("自动") >= 0) m = 2;
+    else if (cmd.indexOf("fan")  >= 0 || cmd.indexOf("送风") >= 0) m = 3;
+    else if (cmd.indexOf("dry")  >= 0 || cmd.indexOf("除湿") >= 0) m = 4;
+    else sscanf(cmd.c_str(), "mode %d", &m);
+    g_testMode = constrain(m, 0, 4);
+    const char* modeStr[] = {"制冷","制热","自动","送风","除湿"};
+    termPrint("[*] 模式 → %s，正在发射...", modeStr[g_testMode]);
+    if (!irSend()) termPrint("[E] 发射失败");
+
+  } else if (cmd.startsWith("temp")) {
+    // temp <16-30>  或  temp+ / temp-
+    g_testIsAc   = true;
+    g_acFuncCode = 0;  // 温度用完整帧
+    if (cmd == "temp+")      g_testTemp = min(g_testTemp + 1, 30);
+    else if (cmd == "temp-") g_testTemp = max(g_testTemp - 1, 16);
+    else { int t=g_testTemp; sscanf(cmd.c_str(), "temp %d", &t); g_testTemp=constrain(t,16,30); }
+    termPrint("[*] 温度 → %d℃，正在发射...", g_testTemp);
+    if (!irSend()) termPrint("[E] 发射失败");
   } else if (cmd == "off") {
-    g_testIsAc  = true;
-    g_testPower = 1;
+    g_testIsAc   = true;
+    g_testPower  = 1;
+    g_acFuncCode = 0;  // AC_FUNCTION_POWER
     if (irSend()) termPrint("[*] 关机指令已发射");
     else          termPrint("[E] 发射失败");
     g_testPower = 0;  // 发完自动复位，下次 resend 仍是开机
