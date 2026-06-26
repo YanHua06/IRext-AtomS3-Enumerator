@@ -4,6 +4,6 @@
 .vscode/launch.json
 .vscode/ipch
 _manifest.txt
-irext_db_20260519_sqlite3.db
+irext_db_*.db
 data/
-irext-binaries_20260519/
+irext-binaries_*/

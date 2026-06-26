@@ -363,13 +363,16 @@ void handleCommand(const String& rawCmd) {
     if (!irSend()) termPrint("[E] 发射失败");
 
   } else if (cmd.startsWith("swing")) {
-    // swing on / swing off / swing（切换）
-    g_testIsAc   = true;
-    g_acFuncCode = 10; // AC_FUNCTION_WIND_SWING
-    if (cmd == "swing on")       g_testSwing = 0;
-    else if (cmd == "swing off") g_testSwing = 1;
-    else                         g_testSwing = g_testSwing ? 0 : 1; // 切换
-    termPrint("[*] 扫风 → %s，正在发射...", g_testSwing==0?"开":"关");
+    // swing on  → keycode 10（摆风开）
+    // swing off → keycode 11（固定风向，停止摆动）
+    // swing     → 切换
+    g_testIsAc = true;
+    if (cmd == "swing on")        g_testSwing = 0;
+    else if (cmd == "swing off")  g_testSwing = 1;
+    else                          g_testSwing = g_testSwing ? 0 : 1;
+    g_acFuncCode = (g_testSwing == 0) ? 10 : 11; // 10=SWING, 11=FIX
+    termPrint("[*] 扫风 → %s (keycode=%d)，正在发射...",
+              g_testSwing==0 ? "摆动开" : "固定(关)", g_acFuncCode);
     if (!irSend()) termPrint("[E] 发射失败");
 
   } else if (cmd.startsWith("mode")) {
@@ -529,6 +532,14 @@ static const char WEB_HTML[] PROGMEM = R"rawhtml(
   #shortcuts{display:flex;gap:6px;padding:6px 12px;border-bottom:1px solid #00ff4133;flex-wrap:wrap;flex-shrink:0}
   .sc{padding:4px 10px;background:#001a00;border:1px solid #00ff4155;color:#00ff41;cursor:pointer;font-size:11px;border-radius:2px}
   .sc:active{background:#003300}
+  /* 参数控制面板 */
+  #ctrlpanel{padding:6px 12px;border-bottom:1px solid #00ff4133;flex-shrink:0;display:flex;flex-direction:column;gap:5px}
+  .ctrlrow{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .clabel{font-size:11px;color:#669966;width:36px;flex-shrink:0}
+  .cb{padding:3px 9px;background:#001a00;border:1px solid #00ff4133;color:#00cc33;cursor:pointer;font-size:11px;border-radius:2px;white-space:nowrap}
+  .cb:active,.cb.active{background:#00ff41;color:#000;border-color:#00ff41}
+  .cb.danger{border-color:#ff555555;color:#ff8888}
+  .cb.danger:active{background:#ff3333;color:#fff}
 </style>
 </head>
 <body>
@@ -545,6 +556,41 @@ static const char WEB_HTML[] PROGMEM = R"rawhtml(
   <button class="sc" onclick="send('status')">ℹ status</button>
   <button class="sc" onclick="send('list')">📋 list</button>
   <button class="sc" onclick="send('help')">? help</button>
+</div>
+<div id="ctrlpanel">
+  <div class="ctrlrow">
+    <span class="clabel">电源</span>
+    <button class="cb" onclick="send('resend')">开机</button>
+    <button class="cb danger" onclick="send('off')">关机</button>
+  </div>
+  <div class="ctrlrow">
+    <span class="clabel">温度</span>
+    <button class="cb" onclick="send('temp-')">－</button>
+    <button class="cb" id="btnTemp" onclick="">26℃</button>
+    <button class="cb" onclick="send('temp+')">＋</button>
+  </div>
+  <div class="ctrlrow">
+    <span class="clabel">模式</span>
+    <button class="cb" onclick="setMode(0)">制冷</button>
+    <button class="cb" onclick="setMode(1)">制热</button>
+    <button class="cb" onclick="setMode(2)">自动</button>
+    <button class="cb" onclick="setMode(3)">送风</button>
+    <button class="cb" onclick="setMode(4)">除湿</button>
+  </div>
+  <div class="ctrlrow">
+    <span class="clabel">风速</span>
+    <button class="cb" onclick="setFan(0)">自动</button>
+    <button class="cb" onclick="setFan(1)">低</button>
+    <button class="cb" onclick="setFan(2)">中</button>
+    <button class="cb" onclick="setFan(3)">高</button>
+    <button class="cb" style="margin-left:8px" onclick="send('fan-')">－</button>
+    <button class="cb" onclick="send('fan+')">＋</button>
+  </div>
+  <div class="ctrlrow">
+    <span class="clabel">扫风</span>
+    <button class="cb" id="btnSwingOn"  onclick="send('swing on')">摆动开</button>
+    <button class="cb" id="btnSwingOff" onclick="send('swing off')">固定</button>
+  </div>
 </div>
 <div id="term"></div>
 <div id="inputrow">
@@ -578,6 +624,42 @@ function send(cmd) {
   else append('[离线] 未连接', 'err');
 }
 
+// 面板辅助
+let curTemp=26, curMode=0, curFan=0, curSwing=0;
+const modeNames=['制冷','制热','自动','送风','除湿'];
+const fanNames=['自动','低','中','高'];
+
+function setMode(m){ send('mode '+m); }
+function setFan(f){  send('fan '+f);  }
+
+function syncPanel(text){
+  // 从日志消息中同步面板状态
+  let m;
+  if((m=text.match(/温度\s*→\s*(\d+)℃/))){
+    curTemp=parseInt(m[1]);
+    document.getElementById('btnTemp').textContent=curTemp+'℃';
+  }
+  if((m=text.match(/风速\s*→\s*(自动|低|中|高)/))){
+    const fi=fanNames.indexOf(m[1]);
+    document.querySelectorAll('#ctrlpanel .ctrlrow:nth-child(4) .cb').forEach((b,i)=>{
+      b.classList.toggle('active', i===fi);
+    });
+  }
+  if((m=text.match(/模式\s*→\s*(制冷|制热|自动|送风|除湿)/))){
+    const mi=modeNames.indexOf(m[1]);
+    document.querySelectorAll('#ctrlpanel .ctrlrow:nth-child(3) .cb').forEach((b,i)=>{
+      b.classList.toggle('active', i===mi);
+    });
+  }
+  if(text.includes('摆动开')){
+    document.getElementById('btnSwingOn').classList.add('active');
+    document.getElementById('btnSwingOff').classList.remove('active');
+  } else if(text.includes('固定(关)')){
+    document.getElementById('btnSwingOff').classList.add('active');
+    document.getElementById('btnSwingOn').classList.remove('active');
+  }
+}
+
 function sendInput() {
   const v = inp.value.trim();
   if (!v) return;
@@ -599,7 +681,7 @@ function connect() {
     append('─── 已连接 IRext AtomS3 ───', 'sys');
     ws.send('status');
   };
-  ws.onmessage = e => append(e.data);
+  ws.onmessage = e => { append(e.data); syncPanel(e.data); };
   ws.onclose = () => {
     dot.className='';
     append('─── 连接断开，3s 后重连 ───', 'sys');
