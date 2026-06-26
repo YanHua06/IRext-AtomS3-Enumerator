@@ -45,7 +45,10 @@ extern "C" {
 // ════════════════════════════════════════════════════════
 // 配置
 // ════════════════════════════════════════════════════════
-#define IR_PIN          4
+#define IR_PIN_INTERNAL  4       // G4  - 内部红外 LED
+#define IR_PIN_EXTERNAL  6       // G6  - 外置红外发射模块
+#define IR_RECV_PIN      39      // G39 - 外置红外接收头
+
 #define BTN_PIN         41        // AtomS3 Lite 内置按键
 #define AP_SSID         "IRext-Enumerator"
 #define AP_PASS         "12345678"
@@ -55,6 +58,10 @@ extern "C" {
 #define DNS_PORT        53
 #define LOG_BUF_MAX     128       // 终端历史行数
 #define LOG_LINE_LEN    160
+#define LEARN_TIMEOUT_MS 30000    // 学习模式超时 30 秒
+#define LEARNED_DIR      "/learned"
+#define LEARNED_INDEX    "/learned/index.json"
+#define MAX_LEARNED      50
 
 // 默认测试指令（枚举时发射）
 // 空调：开机26℃制冷；电视：电源键keycode=0
@@ -76,6 +83,14 @@ AsyncWebServer  webServer(WEB_PORT);
 AsyncWebSocket  ws("/ws");
 DNSServer       dnsServer;
 WiFiServer      tcpServer(TCP_PORT);
+
+// IR 输出选择 & 学习状态
+static int            g_irSendPin    = IR_PIN_INTERNAL;
+static bool           g_learnMode    = false;
+static bool           g_learnCaptured = false;
+static uint16_t       g_learnFreq    = 38000;
+static std::vector<uint16_t> g_learnRawBuf;  // 捕获的微秒时序
+static unsigned long  g_learnStartMs = 0;     // 学习超时计时
 
 // ════════════════════════════════════════════════════════
 // 日志 / 终端输出（串口 + WebSocket 广播）
@@ -137,7 +152,22 @@ bool irSend() {
   }
 
   if (rawLen == 0) { termPrint("[E] ir_decode 返回空"); return false; }
+
+  // 切换到指定输出引脚
+  if (IrSender.sendPin != g_irSendPin) {
+    IrSender.setSendPin(g_irSendPin);
+  }
+
+  // 学习模式下暂停接收，避免捕获自身发射的红外
+  if (g_learnMode) IrReceiver.stop();
+
   IrSender.sendRaw(g_rawBuf, rawLen, 38);
+
+  // 恢复接收
+  if (g_learnMode) {
+    delay(50);
+    IrReceiver.start();
+  }
   return true;
 }
 
@@ -237,6 +267,204 @@ void enumResend() {
 }
 
 // ════════════════════════════════════════════════════════
+// IR 学习 — 接收 & 存储已学码
+// ════════════════════════════════════════════════════════
+
+struct LearnedEntry {
+  int id;
+  String name;
+  String file;
+  uint16_t frequency;
+};
+
+static std::vector<LearnedEntry> g_learnedList;
+static int g_nextLearnId = 1;
+
+void learnLoadIndex() {
+  g_learnedList.clear();
+  g_nextLearnId = 1;
+
+  if (!LittleFS.exists(LEARNED_INDEX)) return;
+
+  File f = LittleFS.open(LEARNED_INDEX, "r");
+  if (!f) return;
+
+  String content = f.readString();
+  f.close();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, content) != DeserializationError::Ok) return;
+
+  for (JsonVariant entry : doc.as<JsonArray>()) {
+    LearnedEntry e;
+    e.id        = entry["id"] | 0;
+    e.name      = entry["name"] | "";
+    e.file      = entry["file"] | "";
+    e.frequency = entry["frequency"] | 38000;
+    g_learnedList.push_back(e);
+    if (e.id >= g_nextLearnId) g_nextLearnId = e.id + 1;
+  }
+}
+
+void learnSaveIndex() {
+  JsonDocument doc;
+  for (auto& e : g_learnedList) {
+    JsonObject obj = doc.add<JsonObject>();
+    obj["id"]        = e.id;
+    obj["name"]      = e.name;
+    obj["file"]      = e.file;
+    obj["frequency"] = e.frequency;
+  }
+
+  File f = LittleFS.open(LEARNED_INDEX, "w");
+  if (f) {
+    serializeJson(doc, f);
+    f.close();
+  }
+}
+
+bool learnSaveRaw(const String& filePath, uint16_t freqHz) {
+  if (g_learnRawBuf.empty()) return false;
+
+  File f = LittleFS.open(filePath, "w");
+  if (!f) { termPrint("[E] 无法创建 %s", filePath.c_str()); return false; }
+
+  f.write((uint8_t*)&freqHz, 2);
+  uint16_t rawlen = g_learnRawBuf.size();
+  f.write((uint8_t*)&rawlen, 2);
+  f.write((uint8_t*)g_learnRawBuf.data(), rawlen * 2);
+  f.close();
+  return true;
+}
+
+void learnPollReceiver() {
+  if (!g_learnMode) return;
+
+  // 30s 超时检查
+  if (millis() - g_learnStartMs > LEARN_TIMEOUT_MS) {
+    g_learnMode = false;
+    g_learnCaptured = false;
+    g_learnRawBuf.clear();
+    termPrint("[LEARN] 30秒无信号，已自动退出学习模式");
+    return;
+  }
+
+  if (IrReceiver.decode()) {
+    g_learnCaptured = true;
+    g_learnRawBuf.clear();
+
+    // 从 irparams.rawbuf[] 提取 raw tick 值并转换为微秒
+    // rawbuf[] 是 uint8_t 的 50µs tick 值 (MICROS_PER_TICK=50)
+    uint16_t rawlen = IrReceiver.decodedIRData.rawlen;
+    if (rawlen > 0) {
+      // rawbuf[0] 是 initial gap, 从 rawbuf[1] 开始是实际的 mark/space 时序
+      for (IRRawlenType i = 1; i < rawlen; i++) {
+        uint32_t us = (uint32_t)IrReceiver.irparams.rawbuf[i] * MICROS_PER_TICK;
+        // 在 uint16_t 范围内 (最大 255*50=12750 µs, 对于大多数遥控器足够)
+        g_learnRawBuf.push_back((uint16_t)us);
+      }
+      g_learnFreq = 38000;  // 默认 38kHz
+    }
+
+    termPrint("[LEARN] 捕获！原始长度: %d 个脉冲 (freq=%d Hz)",
+              (int)g_learnRawBuf.size(), g_learnFreq);
+    termPrint("[LEARN] 输入 learn save <名称> 保存, learn cancel 丢弃");
+
+    IrReceiver.resume();
+  }
+}
+
+void learnSave(const String& name) {
+  if (!g_learnCaptured) {
+    termPrint("[E] 没有捕获到的红外码，请先对准接收器按遥控器");
+    return;
+  }
+  if (g_learnRawBuf.empty()) {
+    termPrint("[E] 捕获数据为空，请重新学习");
+    g_learnCaptured = false;
+    return;
+  }
+
+  char fileName[32];
+  snprintf(fileName, sizeof(fileName), "/learned/ir_%04d.raw", g_nextLearnId);
+
+  if (!learnSaveRaw(fileName, g_learnFreq)) {
+    termPrint("[E] 保存文件失败");
+    return;
+  }
+
+  LearnedEntry entry;
+  entry.id        = g_nextLearnId++;
+  entry.name      = name;
+  entry.file      = String(fileName);
+  entry.frequency = g_learnFreq;
+  g_learnedList.push_back(entry);
+  learnSaveIndex();
+
+  g_learnCaptured = false;
+  g_learnRawBuf.clear();
+  termPrint("[LEARN] 已保存: #%d \"%s\"", entry.id, name.c_str());
+}
+
+void learnDelete(int id) {
+  for (auto it = g_learnedList.begin(); it != g_learnedList.end(); ++it) {
+    if (it->id == id) {
+      LittleFS.remove(it->file);
+      g_learnedList.erase(it);
+      learnSaveIndex();
+      termPrint("[LEARN] 已删除 #%d", id);
+      return;
+    }
+  }
+  termPrint("[E] 未找到学习码 #%d", id);
+}
+
+bool sendLearnedCode(const String& filePath) {
+  File f = LittleFS.open(filePath, "r");
+  if (!f) { termPrint("[E] 无法打开 %s", filePath.c_str()); return false; }
+
+  uint16_t freqHz = 0, rawlen = 0;
+  if (f.read((uint8_t*)&freqHz, 2) != 2 ||
+      f.read((uint8_t*)&rawlen, 2) != 2) {
+    termPrint("[E] 读取头失败");
+    f.close();
+    return false;
+  }
+
+  if (rawlen == 0) {
+    termPrint("[E] raw 数据为空");
+    f.close();
+    return false;
+  }
+
+  uint16_t* rawBuf = (uint16_t*)malloc(rawlen * 2);
+  if (!rawBuf) { termPrint("[E] malloc 失败"); f.close(); return false; }
+  if (f.read((uint8_t*)rawBuf, rawlen * 2) != (int)(rawlen * 2)) {
+    termPrint("[E] 读取 raw 数据失败");
+    free(rawBuf);
+    f.close();
+    return false;
+  }
+  f.close();
+
+  // 切换输出引脚
+  if (IrSender.sendPin != g_irSendPin) {
+    IrSender.setSendPin(g_irSendPin);
+  }
+
+  uint16_t freqKHz = freqHz / 1000;
+  if (freqKHz == 0) freqKHz = 38;
+
+  if (g_learnMode) IrReceiver.stop();
+  IrSender.sendRaw(rawBuf, rawlen, freqKHz);
+  if (g_learnMode) { delay(50); IrReceiver.start(); }
+
+  free(rawBuf);
+  termPrint("[*] 发射已学码 (freq=%dHz len=%d)", freqHz, rawlen);
+  return true;
+}
+
+// ════════════════════════════════════════════════════════
 // 命令解析（串口 / WebSocket 共用）
 // ════════════════════════════════════════════════════════
 void printStatus() {
@@ -252,6 +480,12 @@ void printStatus() {
   if (g_testIsAc) termPrint("  空调参数: temp=%d mode=%d fan=%d", g_testTemp, g_testMode, g_testFan);
   else            termPrint("  按键码  : %d", g_testKeycode);
   termPrint("AP SSID : %s  IP: 192.168.4.1", AP_SSID);
+  termPrint("IR 输出 : %s (GPIO%d)",
+    g_irSendPin == IR_PIN_INTERNAL ? "内部" : "外部", g_irSendPin);
+  termPrint("学习模式: %s%s",
+    g_learnMode ? "开启" : "关闭",
+    g_learnCaptured ? " (已捕获，等待保存)" : "");
+  termPrint("已学码  : %d 条", (int)g_learnedList.size());
   termPrint("──────────────────────────────────────");
 }
 
@@ -282,6 +516,20 @@ void printHelp() {
   termPrint("║  settv <keycode>  切换为TV按键模式     ║");
   termPrint("║  setcat <cat><sub> 手动设category      ║");
   termPrint("║  help         显示此帮助               ║");
+  termPrint("╠══════════════════════════════════════╣");
+  termPrint("║ IR 输出选择                           ║");
+  termPrint("║  ir internal/int  使用内部 IR (GPIO4) ║");
+  termPrint("║  ir external/ext  使用外部 IR (GPIO6) ║");
+  termPrint("║  ir status        查看当前输出选择    ║");
+  termPrint("╠══════════════════════════════════════╣");
+  termPrint("║ IR 学习                               ║");
+  termPrint("║  learn            进入学习模式        ║");
+  termPrint("║  learn save <名称> 保存捕获的码       ║");
+  termPrint("║  learn cancel     放弃当前捕获        ║");
+  termPrint("║  learn list       列出已学码          ║");
+  termPrint("║  learn play <id>  发射已学码          ║");
+  termPrint("║  learn delete <id> 删除已学码         ║");
+  termPrint("║  learn stop       退出学习模式        ║");
   termPrint("╚══════════════════════════════════════╝");
 }
 
@@ -420,6 +668,76 @@ void handleCommand(const String& rawCmd) {
     termPrint("[*] category=%d sub_category=%d", cat, sub);
   } else if (cmd.startsWith("loglevel")) {
     termPrint("[*] loglevel 仅影响串口详细输出（暂未分级）");
+
+  // ─── IR 输出选择 ───
+  } else if (cmd == "ir internal" || cmd == "ir int") {
+    g_irSendPin = IR_PIN_INTERNAL;
+    termPrint("[*] IR 输出切换为: 内部 (GPIO%d)", IR_PIN_INTERNAL);
+  } else if (cmd == "ir external" || cmd == "ir ext") {
+    g_irSendPin = IR_PIN_EXTERNAL;
+    termPrint("[*] IR 输出切换为: 外部 (GPIO%d)", IR_PIN_EXTERNAL);
+  } else if (cmd == "ir status") {
+    termPrint("[*] IR 输出: %s (GPIO%d)",
+      g_irSendPin == IR_PIN_INTERNAL ? "内部" : "外部", g_irSendPin);
+
+  // ─── IR 学习 ───
+  } else if (cmd == "learn") {
+    if (g_enumState == RUNNING) {
+      termPrint("[E] 枚举进行中，无法进入学习模式");
+    } else {
+      g_learnMode      = true;
+      g_learnCaptured  = false;
+      g_learnRawBuf.clear();
+      g_learnStartMs   = millis();
+      IrReceiver.start();
+      termPrint("[LEARN] 学习模式已开启 (30s超时)，对准外置接收器按遥控器...");
+      termPrint("[LEARN] 捕获后输入 'learn save <名称>' 保存, 'learn cancel' 取消");
+    }
+  } else if (cmd == "learn cancel") {
+    g_learnMode      = false;
+    g_learnCaptured  = false;
+    g_learnRawBuf.clear();
+    termPrint("[LEARN] 学习已取消");
+  } else if (cmd.startsWith("learn save ")) {
+    String name = cmd.substring(11);
+    name.trim();
+    if (name.length() == 0) {
+      termPrint("[E] 用法: learn save <名称>");
+    } else {
+      learnSave(name);
+      g_learnMode = false;  // 保存后退出学习模式
+    }
+  } else if (cmd.startsWith("learn play ")) {
+    int id = cmd.substring(11).toInt();
+    bool found = false;
+    for (auto& e : g_learnedList) {
+      if (e.id == id) {
+        if (sendLearnedCode(e.file)) {
+          termPrint("[LEARN] 已发射 #%d \"%s\"", id, e.name.c_str());
+        }
+        found = true;
+        break;
+      }
+    }
+    if (!found) termPrint("[E] 未找到学习码 #%d", id);
+  } else if (cmd == "learn list") {
+    if (g_learnedList.empty()) {
+      termPrint("[LEARN] 没有已学习的红外码");
+    } else {
+      termPrint("[LEARN] 已学习红外码 (%d):", (int)g_learnedList.size());
+      for (auto& e : g_learnedList) {
+        termPrint("  #%d: \"%s\" (freq=%dHz)", e.id, e.name.c_str(), e.frequency);
+      }
+    }
+  } else if (cmd.startsWith("learn delete ")) {
+    int id = cmd.substring(13).toInt();
+    learnDelete(id);
+  } else if (cmd == "learn stop") {
+    g_learnMode      = false;
+    g_learnCaptured  = false;
+    g_learnRawBuf.clear();
+    termPrint("[LEARN] 学习模式已关闭");
+
   } else {
     termPrint("[?] 未知命令，输入 help 查看列表");
   }
@@ -540,6 +858,11 @@ static const char WEB_HTML[] PROGMEM = R"rawhtml(
   .cb:active,.cb.active{background:#00ff41;color:#000;border-color:#00ff41}
   .cb.danger{border-color:#ff555555;color:#ff8888}
   .cb.danger:active{background:#ff3333;color:#fff}
+  /* 学习面板 */
+  #learnpanel{padding:6px 12px;border-bottom:1px solid #00ff4133;flex-shrink:0;display:none;flex-direction:column;gap:5px}
+  .lb{padding:3px 9px;background:#001a00;border:1px solid #ffaa0055;color:#ffaa00;cursor:pointer;font-size:11px;border-radius:2px;white-space:nowrap}
+  .lb:active{background:#ffaa00;color:#000}
+  .linput{background:#001a00;border:1px solid #ffaa0055;color:#ffaa00;font-family:inherit;font-size:11px;padding:3px 6px;width:90px;outline:none;caret-color:#ffaa00}
 </style>
 </head>
 <body>
@@ -558,6 +881,11 @@ static const char WEB_HTML[] PROGMEM = R"rawhtml(
   <button class="sc" onclick="send('help')">? help</button>
 </div>
 <div id="ctrlpanel">
+  <div class="ctrlrow" style="margin-bottom:2px;border-bottom:1px solid #00ff4122;padding-bottom:3px">
+    <span class="clabel">IR输出</span>
+    <button class="cb active" id="btnIrInt" onclick="setIrOutput('int')">内部</button>
+    <button class="cb" id="btnIrExt" onclick="setIrOutput('ext')">外部</button>
+  </div>
   <div class="ctrlrow">
     <span class="clabel">电源</span>
     <button class="cb" onclick="send('resend')">开机</button>
@@ -590,6 +918,24 @@ static const char WEB_HTML[] PROGMEM = R"rawhtml(
     <span class="clabel">扫风</span>
     <button class="cb" id="btnSwingOn"  onclick="send('swing on')">摆动开</button>
     <button class="cb" id="btnSwingOff" onclick="send('swing off')">固定</button>
+  </div>
+</div>
+<div id="learnpanel">
+  <div class="ctrlrow">
+    <span class="clabel" style="color:#ffaa00;width:36px">学习</span>
+    <button class="lb" id="btnLearnStart" onclick="send('learn')">开始</button>
+    <button class="lb" onclick="send('learn stop')">停止</button>
+    <button class="lb" onclick="send('learn cancel')">取消</button>
+    <input class="linput" id="learnName" type="text" placeholder="名称">
+    <button class="lb" onclick="saveLearn()">保存</button>
+    <button class="lb" onclick="send('learn list')">列表</button>
+  </div>
+  <div class="ctrlrow">
+    <span class="clabel" style="color:#ffaa00;width:36px"></span>
+    <span style="font-size:10px;color:#887744">ID:</span>
+    <input class="linput" id="learnPlayId" type="text" placeholder="编号" style="width:50px">
+    <button class="lb" onclick="playLearn()">发射</button>
+    <button class="lb" onclick="deleteLearn()">删除</button>
   </div>
 </div>
 <div id="term"></div>
@@ -632,6 +978,38 @@ const fanNames=['自动','低','中','高'];
 function setMode(m){ send('mode '+m); }
 function setFan(f){  send('fan '+f);  }
 
+// IR 输出切换
+function setIrOutput(mode) {
+  if (mode === 'int') {
+    send('ir internal');
+    document.getElementById('btnIrInt').classList.add('active');
+    document.getElementById('btnIrExt').classList.remove('active');
+  } else {
+    send('ir external');
+    document.getElementById('btnIrExt').classList.add('active');
+    document.getElementById('btnIrInt').classList.remove('active');
+  }
+}
+
+// 学习面板
+function saveLearn() {
+  const name = document.getElementById('learnName').value.trim();
+  if (!name) { append('[提示] 请先输入名称', 'sys'); return; }
+  send('learn save ' + name);
+}
+
+function playLearn() {
+  const id = document.getElementById('learnPlayId').value.trim();
+  if (!id) { append('[提示] 请输入ID编号', 'sys'); return; }
+  send('learn play ' + id);
+}
+
+function deleteLearn() {
+  const id = document.getElementById('learnPlayId').value.trim();
+  if (!id) { append('[提示] 请输入ID编号', 'sys'); return; }
+  send('learn delete ' + id);
+}
+
 function syncPanel(text){
   // 从日志消息中同步面板状态
   let m;
@@ -641,13 +1019,13 @@ function syncPanel(text){
   }
   if((m=text.match(/风速\s*→\s*(自动|低|中|高)/))){
     const fi=fanNames.indexOf(m[1]);
-    document.querySelectorAll('#ctrlpanel .ctrlrow:nth-child(4) .cb').forEach((b,i)=>{
+    document.querySelectorAll('#ctrlpanel .ctrlrow:nth-child(5) .cb').forEach((b,i)=>{
       b.classList.toggle('active', i===fi);
     });
   }
   if((m=text.match(/模式\s*→\s*(制冷|制热|自动|送风|除湿)/))){
     const mi=modeNames.indexOf(m[1]);
-    document.querySelectorAll('#ctrlpanel .ctrlrow:nth-child(3) .cb').forEach((b,i)=>{
+    document.querySelectorAll('#ctrlpanel .ctrlrow:nth-child(4) .cb').forEach((b,i)=>{
       b.classList.toggle('active', i===mi);
     });
   }
@@ -657,6 +1035,29 @@ function syncPanel(text){
   } else if(text.includes('固定(关)')){
     document.getElementById('btnSwingOff').classList.add('active');
     document.getElementById('btnSwingOn').classList.remove('active');
+  }
+  // IR 输出状态
+  if(text.includes('IR 输出切换为: 内部')){
+    document.getElementById('btnIrInt').classList.add('active');
+    document.getElementById('btnIrExt').classList.remove('active');
+  } else if(text.includes('IR 输出切换为: 外部')){
+    document.getElementById('btnIrExt').classList.add('active');
+    document.getElementById('btnIrInt').classList.remove('active');
+  }
+  // 学习模式状态
+  if(text.includes('[LEARN] 学习模式已开启')){
+    document.getElementById('learnpanel').style.display = 'flex';
+    document.getElementById('learnName').value = '';
+    document.getElementById('learnName').placeholder = '等待捕获...';
+    document.getElementById('learnPlayId').value = '';
+  } else if(text.includes('[LEARN] 30秒无信号') || text.includes('学习模式已关闭') || text.includes('已保存:')){
+    document.getElementById('learnpanel').style.display = 'none';
+  } else if(text.includes('[LEARN] 捕获')){
+    document.getElementById('learnName').placeholder = '输入名称后保存';
+    document.getElementById('learnName').style.borderColor = '#ffaa00';
+  } else if(text.includes('[LEARN] 已保存')){
+    document.getElementById('learnName').style.borderColor = '#ffaa0055';
+    document.getElementById('learnName').value = '';
   }
 }
 
@@ -745,16 +1146,22 @@ void setup() {
   delay(400);
 
   pinMode(BTN_PIN, INPUT_PULLUP);
-  IrSender.begin(IR_PIN);
+  IrSender.begin(g_irSendPin);
+  IrReceiver.begin(IR_RECV_PIN, DISABLE_LED_FEEDBACK);
 
   // LittleFS
   if (!LittleFS.begin(true)) {
     Serial.println("[E] LittleFS 挂载失败");
   }
 
+  // 加载已学红外码清单
+  learnLoadIndex();
+
   termPrint("╔══════════════════════════════════════╗");
   termPrint("║   IRext AtomS3 Lite — 独立枚举器     ║");
   termPrint("╚══════════════════════════════════════╝");
+  termPrint("[*] IR 输出: 内部(GPIO%d)  |  接收: GPIO%d  |  已学码: %d 条",
+    IR_PIN_INTERNAL, IR_RECV_PIN, (int)g_learnedList.size());
 
   // 扫描 bin 文件，决定工作模式
   enumLoadBinList();
@@ -814,6 +1221,9 @@ void loop() {
 
   // 按键
   handleButton();
+
+  // IR 学习接收轮询
+  if (g_learnMode) learnPollReceiver();
 
   // 串口命令
   while (Serial.available()) {
