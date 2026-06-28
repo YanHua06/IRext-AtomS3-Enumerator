@@ -18,7 +18,7 @@ PlatformIO CLI (`pio`) is at `C:\Users\qjy20\.platformio\penv\Scripts\pio.exe`.
 
 ## Architecture
 
-**Single-file firmware** — `src/main.cpp` (~1260 lines) contains everything: IR send/receive, enumeration state machine, IR learning, Web UI (HTML/CSS/JS as PROGMEM string), WebSocket server, TCP mode-B protocol, serial command parser, and button handler.
+**Single-file firmware** — `src/main.cpp` (~1600 lines) contains everything: IR send/receive, enumeration state machine, IR learning, WiFi channel scanner, Web UI (HTML/CSS/JS as PROGMEM string), WebSocket server, TCP mode-B protocol, serial command parser, and button handler.
 
 **IRext C library** (`src/ir_decode/`) — unmodified upstream. `ir_binary_open()` parses proprietary `.bin` files, `ir_decode()` produces raw IR timing arrays. Called via `extern "C"` from `main.cpp`.
 
@@ -49,6 +49,18 @@ PlatformIO CLI (`pio`) is at `C:\Users\qjy20\.platformio\penv\Scripts\pio.exe`.
 - 30-second timeout auto-exits learning mode
 - `irSend()` stops receiver during send to prevent self-capture
 
+### WiFi Channel Scanner (added 2026-06-28)
+
+- `wifi scan` / `wifi` command triggers channel-by-channel scan (CH1–13, 350ms/ch)
+- Scan flow: SoftAP off → STA mode → per-channel scan → congestion analysis → SoftAP restore
+- Congestion scoring: RSSI-weighted + adjacent channel overlap (CH±2)
+- Recommendations: best among 1/6/11, and best among all 1–13
+- Commands: `wifi scan`, `wifi status`, `wifi list`, `wifi ch`
+- HTTP JSON endpoint: `/wifi-json`
+- Web UI: three blue shortcut buttons in terminal header
+- Globals prefixed `g_wifi*`; functions prefixed `wifi*`; all `static` linkage
+- Editing PROGMEM HTML via Edit tool is fragile — prefer `sed -i` by line number
+
 ### Web UI
 
 - Single-page terminal emulator served from PROGMEM
@@ -56,6 +68,7 @@ PlatformIO CLI (`pio`) is at `C:\Users\qjy20\.platformio\penv\Scripts\pio.exe`.
 - AC control panel: power, temp, mode, fan, swing
 - IR output selector: internal/external toggle
 - Learning panel: start/stop/save/list/play/delete
+- WiFi scan shortcuts: 📡WiFi / 📶信道 / 📋AP列表 (blue style)
 
 ### Command System
 
