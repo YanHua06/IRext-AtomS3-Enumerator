@@ -63,6 +63,12 @@ extern "C" {
 #define LEARNED_INDEX    "/learned/index.json"
 #define MAX_LEARNED      50
 
+// WiFi 扫描模块
+#define WIFI_SCAN_MAX_APS     100
+#define WIFI_SCAN_MS_PER_CH   350
+#define WIFI_SCAN_CH_MIN      1
+#define WIFI_SCAN_CH_MAX      13
+
 // 默认测试指令（枚举时发射）
 // 空调：开机26℃制冷；电视：电源键keycode=0
 static int  g_testKeycode  = 0;
@@ -91,6 +97,25 @@ static bool           g_learnCaptured = false;
 static uint16_t       g_learnFreq    = 38000;
 static std::vector<uint16_t> g_learnRawBuf;  // 捕获的微秒时序
 static unsigned long  g_learnStartMs = 0;     // 学习超时计时
+
+// WiFi 扫描模块全局状态
+struct WiFiAPInfo {
+  String ssid;
+  String bssid;
+  int32_t rssi;
+  int32_t channel;
+  wifi_auth_mode_t enc;
+};
+static WiFiAPInfo g_wifiAps[WIFI_SCAN_MAX_APS];
+static int         g_wifiApCount      = 0;
+static float       g_wifiChScore[14];      // 1-13
+static int         g_wifiChDirect[14];
+static bool        g_wifiScanRequested  = false;
+static bool        g_wifiScanning       = false;
+static String      g_wifiLastInfo       = "尚未扫描";
+static String      g_wifiLastApIP       = "192.168.4.1";
+static int         g_wifiBestCommon     = 6;
+static int         g_wifiBestAll        = 6;
 
 // ════════════════════════════════════════════════════════
 // 日志 / 终端输出（串口 + WebSocket 广播）
@@ -465,6 +490,197 @@ bool sendLearnedCode(const String& filePath) {
 }
 
 // ════════════════════════════════════════════════════════
+// WiFi 扫描 — 信道拥挤分析
+// ════════════════════════════════════════════════════════
+
+static int wifiFindApByBSSID(const String& bssid) {
+  for (int i = 0; i < g_wifiApCount; i++) {
+    if (g_wifiAps[i].bssid == bssid) return i;
+  }
+  return -1;
+}
+
+static void wifiAddOrUpdateAP(const String& ssid, const String& bssid,
+                              int32_t rssi, int32_t channel, wifi_auth_mode_t enc) {
+  if (channel < WIFI_SCAN_CH_MIN || channel > WIFI_SCAN_CH_MAX) return;
+
+  int idx = wifiFindApByBSSID(bssid);
+  if (idx >= 0) {
+    if (rssi > g_wifiAps[idx].rssi) {
+      g_wifiAps[idx].ssid    = ssid;
+      g_wifiAps[idx].rssi    = rssi;
+      g_wifiAps[idx].channel = channel;
+      g_wifiAps[idx].enc     = enc;
+    }
+    if (g_wifiAps[idx].ssid.length() == 0 && ssid.length() > 0) {
+      g_wifiAps[idx].ssid = ssid;
+    }
+    return;
+  }
+
+  if (g_wifiApCount >= WIFI_SCAN_MAX_APS) return;
+
+  g_wifiAps[g_wifiApCount].ssid    = ssid;
+  g_wifiAps[g_wifiApCount].bssid   = bssid;
+  g_wifiAps[g_wifiApCount].rssi    = rssi;
+  g_wifiAps[g_wifiApCount].channel = channel;
+  g_wifiAps[g_wifiApCount].enc     = enc;
+  g_wifiApCount++;
+}
+
+static float wifiRssiWeight(int32_t rssi) {
+  if (rssi >= -50) return 6.0;
+  if (rssi >= -60) return 4.5;
+  if (rssi >= -67) return 3.5;
+  if (rssi >= -75) return 2.2;
+  if (rssi >= -82) return 1.2;
+  return 0.6;
+}
+
+static float wifiOverlapWeight(int distance) {
+  if (distance == 0) return 1.00;
+  if (distance == 1) return 0.55;
+  if (distance == 2) return 0.20;
+  return 0.00;
+}
+
+static void wifiCalcCongestion() {
+  for (int ch = 1; ch <= 13; ch++) {
+    g_wifiChScore[ch]  = 0;
+    g_wifiChDirect[ch] = 0;
+  }
+  for (int i = 0; i < g_wifiApCount; i++) {
+    int apCh = g_wifiAps[i].channel;
+    if (apCh < 1 || apCh > 13) continue;
+    g_wifiChDirect[apCh]++;
+    float p = wifiRssiWeight(g_wifiAps[i].rssi);
+    for (int ch = 1; ch <= 13; ch++) {
+      g_wifiChScore[ch] += p * wifiOverlapWeight(abs(ch - apCh));
+    }
+  }
+}
+
+static void wifiSortAPs() {
+  for (int i = 0; i < g_wifiApCount - 1; i++) {
+    for (int j = i + 1; j < g_wifiApCount; j++) {
+      bool swapIt = false;
+      if (g_wifiAps[j].channel < g_wifiAps[i].channel) {
+        swapIt = true;
+      } else if (g_wifiAps[j].channel == g_wifiAps[i].channel &&
+                 g_wifiAps[j].rssi    >  g_wifiAps[i].rssi) {
+        swapIt = true;
+      }
+      if (swapIt) {
+        WiFiAPInfo t = g_wifiAps[i];
+        g_wifiAps[i] = g_wifiAps[j];
+        g_wifiAps[j] = t;
+      }
+    }
+  }
+}
+
+static void wifiRecalcBest() {
+  int bestAll = 1;
+  for (int ch = 2; ch <= 13; ch++) {
+    if (g_wifiChScore[ch] < g_wifiChScore[bestAll]) bestAll = ch;
+  }
+  g_wifiBestAll = bestAll;
+
+  int candidates[] = {1, 6, 11};
+  int bestCommon = candidates[0];
+  for (int i = 1; i < 3; i++) {
+    int ch = candidates[i];
+    if (g_wifiChScore[ch] < g_wifiChScore[bestCommon]) bestCommon = ch;
+  }
+  g_wifiBestCommon = bestCommon;
+}
+
+static const char* wifiAuthStr(wifi_auth_mode_t t) {
+  switch (t) {
+    case WIFI_AUTH_OPEN:            return "OPEN";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ENT";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
+    default:                        return "UNKNOWN";
+  }
+}
+
+static const char* wifiCrowdLabel(float score) {
+  if (score < 3.0)  return "空闲";
+  if (score < 7.0)  return "轻度拥挤";
+  if (score < 12.0) return "中度拥挤";
+  return "严重拥挤";
+}
+
+static const char* wifiCrowdCss(float score) {
+  if (score < 3.0)  return "good";
+  if (score < 7.0)  return "mild";
+  if (score < 12.0) return "mid";
+  return "bad";
+}
+
+static void wifiPerformScan() {
+  g_wifiScanning = true;
+
+  termPrint("[WIFI] 收到扫描请求，关闭 SoftAP 以减少干扰...");
+  termPrint("[WIFI] 网页将暂时不可用，进度请查看串口监视器");
+
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  delay(600);
+
+  g_wifiApCount = 0;
+  for (int ch = 1; ch <= 13; ch++) { g_wifiChScore[ch] = 0; g_wifiChDirect[ch] = 0; }
+
+  termPrint("[WIFI] 开始逐信道扫描 CH%d–CH%d...", WIFI_SCAN_CH_MIN, WIFI_SCAN_CH_MAX);
+
+  for (int ch = WIFI_SCAN_CH_MIN; ch <= WIFI_SCAN_CH_MAX; ch++) {
+    int n = WiFi.scanNetworks(false, true, false, WIFI_SCAN_MS_PER_CH, ch);
+    if (n < 0) {
+      termPrint("[WIFI] CH%02d 扫描失败 code=%d", ch, n);
+    } else {
+      for (int i = 0; i < n; i++) {
+        wifiAddOrUpdateAP(WiFi.SSID(i), WiFi.BSSIDstr(i),
+                          WiFi.RSSI(i), WiFi.channel(i), WiFi.encryptionType(i));
+      }
+    }
+    WiFi.scanDelete();
+    delay(80);
+  }
+
+  wifiSortAPs();
+  wifiCalcCongestion();
+  wifiRecalcBest();
+
+  g_wifiLastInfo = "上电后 " + String(millis() / 1000) + " 秒完成扫描";
+
+  termPrint("[WIFI] 扫描完成: 发现 %d 个 AP，推荐 CH%d (全)/ CH%d (1/6/11)",
+            g_wifiApCount, g_wifiBestAll, g_wifiBestCommon);
+
+  termPrint("[WIFI] 重新启动 SoftAP...");
+  // 直接重调 setup 里的 AP 逻辑
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  IPAddress apIp(AP_IP);
+  WiFi.softAPConfig(apIp, apIp, IPAddress(255,255,255,0));
+  WiFi.softAP(AP_SSID, AP_PASS);
+  g_wifiLastApIP = WiFi.softAPIP().toString();
+  dnsServer.start(DNS_PORT, "*", apIp);
+  webServer.begin();
+
+  g_wifiScanning = false;
+  termPrint("[WIFI] SoftAP 已恢复: http://%s/", g_wifiLastApIP.c_str());
+}
+
+// ════════════════════════════════════════════════════════
 // 命令解析（串口 / WebSocket 共用）
 // ════════════════════════════════════════════════════════
 void printStatus() {
@@ -530,6 +746,12 @@ void printHelp() {
   termPrint("║  learn play <id>  发射已学码          ║");
   termPrint("║  learn delete <id> 删除已学码         ║");
   termPrint("║  learn stop       退出学习模式        ║");
+  termPrint("╠══════════════════════════════════════╣");
+  termPrint("║ WiFi 信道扫描                         ║");
+  termPrint("║  wifi / wifi scan  开始WiFi扫描       ║");
+  termPrint("║  wifi status       查看扫描状态       ║");
+  termPrint("║  wifi list         列出周围AP列表     ║");
+  termPrint("║  wifi ch           查看信道拥挤度     ║");
   termPrint("╚══════════════════════════════════════╝");
 }
 
@@ -679,6 +901,46 @@ void handleCommand(const String& rawCmd) {
   } else if (cmd == "ir status") {
     termPrint("[*] IR 输出: %s (GPIO%d)",
       g_irSendPin == IR_PIN_INTERNAL ? "内部" : "外部", g_irSendPin);
+
+  // ─── WiFi 扫描 ───
+  } else if (cmd == "wifi scan" || cmd == "wifi") {
+    if (!g_wifiScanning) {
+      g_wifiScanRequested = true;
+    } else {
+      termPrint("[WIFI] 扫描已在进行中");
+    }
+  } else if (cmd == "wifi status") {
+    termPrint("─── WiFi 扫描状态 ────────────────────");
+    termPrint("上次扫描 : %s", g_wifiLastInfo.c_str());
+    termPrint("发现 AP  : %d 个", g_wifiApCount);
+    termPrint("推荐信道 : CH%d (全范围) / CH%d (常用1/6/11)",
+              g_wifiBestAll, g_wifiBestCommon);
+    termPrint("──────────────────────────────────────");
+  } else if (cmd == "wifi list") {
+    if (g_wifiApCount == 0) {
+      termPrint("[WIFI] 暂无扫描结果，输入 wifi scan 开始扫描");
+    } else {
+      termPrint("[WIFI] 周围 AP 列表 (%d):", g_wifiApCount);
+      for (int i = 0; i < g_wifiApCount; i++) {
+        termPrint("  %02d | CH%02d | RSSI:%4d dBm | %-10s | %s | SSID:%s",
+                  i + 1, g_wifiAps[i].channel, g_wifiAps[i].rssi,
+                  wifiAuthStr(g_wifiAps[i].enc),
+                  g_wifiAps[i].bssid.c_str(),
+                  g_wifiAps[i].ssid.length() ? g_wifiAps[i].ssid.c_str() : "<hidden>");
+      }
+    }
+  } else if (cmd == "wifi ch") {
+    if (g_wifiApCount == 0) {
+      termPrint("[WIFI] 暂无扫描结果");
+    } else {
+      termPrint("[WIFI] 信道拥挤度:");
+      for (int ch = 1; ch <= 13; ch++) {
+        termPrint("  CH%02d | AP:%2d | Score:%6.2f | %s",
+                  ch, g_wifiChDirect[ch], g_wifiChScore[ch],
+                  wifiCrowdLabel(g_wifiChScore[ch]));
+      }
+      termPrint("[WIFI] 推荐 CH%d (全) / CH%d (1/6/11)", g_wifiBestAll, g_wifiBestCommon);
+    }
 
   // ─── IR 学习 ───
   } else if (cmd == "learn") {
@@ -879,6 +1141,9 @@ static const char WEB_HTML[] PROGMEM = R"rawhtml(
   <button class="sc" onclick="send('status')">ℹ status</button>
   <button class="sc" onclick="send('list')">📋 list</button>
   <button class="sc" onclick="send('help')">? help</button>
+     <button class="sc" style="background:#001a33;border-color:#0088ff66;color:#00aaff" onclick="send('wifi')">📡 WiFi</button>
+     <button class="sc" style="background:#001a33;border-color:#0088ff66;color:#00aaff" onclick="send('wifi ch')">📶 信道</button>
+     <button class="sc" style="background:#001a33;border-color:#0088ff66;color:#00aaff" onclick="send('wifi list')">📋 AP列表</button>
 </div>
 <div id="ctrlpanel">
   <div class="ctrlrow" style="margin-bottom:2px;border-bottom:1px solid #00ff4122;padding-bottom:3px">
@@ -1200,6 +1465,38 @@ void setup() {
   webServer.on("/connecttest.txt",     HTTP_GET, redirect);
   webServer.onNotFound([](AsyncWebServerRequest* req){ req->redirect("http://192.168.4.1/"); });
 
+  // WiFi 扫描结果页（轻量 JSON 接口）
+  webServer.on("/wifi-json", HTTP_GET, [](AsyncWebServerRequest* req){
+    String json;
+    json.reserve(8000);
+    json += "{";
+    json += "\"lastInfo\":\"" + g_wifiLastInfo + "\",";
+    json += "\"apCount\":" + String(g_wifiApCount) + ",";
+    json += "\"bestCommon\":" + String(g_wifiBestCommon) + ",";
+    json += "\"bestAll\":" + String(g_wifiBestAll) + ",";
+    json += "\"channels\":[";
+    for (int ch = 1; ch <= 13; ch++) {
+      if (ch > 1) json += ",";
+      json += "{\"ch\":" + String(ch) + ",";
+      json += "\"cnt\":" + String(g_wifiChDirect[ch]) + ",";
+      json += "\"score\":" + String(g_wifiChScore[ch], 2) + ",";
+      json += "\"level\":\"" + String(wifiCrowdLabel(g_wifiChScore[ch])) + "\"}";
+    }
+    json += "],\"aps\":[";
+    for (int i = 0; i < g_wifiApCount; i++) {
+      if (i > 0) json += ",";
+      json += "{";
+      json += "\"ssid\":\"" + String(g_wifiAps[i].ssid.length() ? g_wifiAps[i].ssid : "<hidden>") + "\",";
+      json += "\"bssid\":\"" + String(g_wifiAps[i].bssid) + "\",";
+      json += "\"rssi\":" + String(g_wifiAps[i].rssi) + ",";
+      json += "\"ch\":" + String(g_wifiAps[i].channel) + ",";
+      json += "\"auth\":\"" + String(wifiAuthStr(g_wifiAps[i].enc)) + "\"";
+      json += "}";
+    }
+    json += "]}";
+    req->send(200, "application/json; charset=utf-8", json);
+  });
+
   webServer.begin();
   termPrint("[*] Web 终端: http://192.168.4.1");
 
@@ -1250,6 +1547,13 @@ void loop() {
     String line = g_tcpClient.readStringUntil('\n');
     line.trim();
     if (line.length()) handleTcpLine(line);
+  }
+
+  // WiFi 扫描触发（延迟执行，让 Web 请求有时间返回）
+  if (g_wifiScanRequested && !g_wifiScanning) {
+    g_wifiScanRequested = false;
+    delay(200);
+    wifiPerformScan();
   }
 }
 
